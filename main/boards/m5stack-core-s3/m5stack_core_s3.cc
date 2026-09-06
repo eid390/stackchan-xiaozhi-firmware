@@ -7,6 +7,7 @@
 #include "i2c_device.h"
 #include "axp2101.h"
 #include "mcp_server.h"
+#include "notify_http_server.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -1348,6 +1349,7 @@ private:
     esp_timer_handle_t touchpad_timer_;
     esp_timer_handle_t batt_timer_ = nullptr;
     PowerSaveTimer* power_save_timer_;
+    NotifyHttpServer* notify_http_server_ = nullptr;
     bool py32_found_ = false;
     // ---- PY32 持久 I2C 设备句柄（控 LED + 其他扩展）----
     i2c_master_dev_handle_t py32_dev_ = nullptr;
@@ -1843,6 +1845,69 @@ private:
             });
     }
 
+    // Claude Code "等你确认"提醒工具 —— 由 notify_http_server 从局域网 HTTP 触发，
+    // 也允许 LLM 直接调用。attention 是"一直亮"直到 dismiss，符合场景：
+    // 你不盯屏幕时派蒙一直提醒，回头随时能看到是哪个项目在等；DismissAlert 只在
+    // Idle 状态下生效（Application::DismissAlert 内部检查），所以对话中不会误清屏。
+    void RegisterNotifyMcpTools() {
+        auto& mcp = McpServer::GetInstance();
+
+        mcp.AddTool("self.notify.attention",
+            "Draw the user's physical attention: shake head 3 times, switch face to a "
+            "waiting emotion, and pin the project name on screen until self.notify.dismiss "
+            "is called. Use ONLY when the local Claude Code process needs the user to "
+            "approve a permission prompt or resume a paused task. NOT for chit-chat.",
+            PropertyList({
+                Property("project", kPropertyTypeString)
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto project = props["project"].value<std::string>();
+                if (project.empty()) project = "Claude Code";
+
+                // 屏幕 + 表情（长驻，不自动清）——用 Application::Schedule 投递
+                // 到主事件循环，避免在 httpd task 里直接摸 UI/audio。
+                auto& app = Application::GetInstance();
+                std::string message = "等你确认: " + project;
+                app.Schedule([message]() {
+                    Application::GetInstance().Alert(
+                        "等你确认",
+                        message.c_str(),
+                        "thinking",
+                        ""  // 不放音，避免打断对话
+                    );
+                });
+
+                // 摇头 3 次——Shake() 内部自己起 task 跑动画 + Pause/Resume tracker，
+                // 已经在 MCP servo 工具里久经验证。三次之间空一小段等前一次跑完。
+                if (servo_ok_) {
+                    for (int i = 0; i < 3; ++i) {
+                        servo_.Shake();
+                        vTaskDelay(pdMS_TO_TICKS(900));
+                    }
+                }
+
+                ESP_LOGI(TAG, "MCP notify attention: %s", project.c_str());
+                return true;
+            });
+
+        mcp.AddTool("self.notify.dismiss",
+            "Clear the 'waiting for approval' alert set by self.notify.attention: "
+            "nod once, restore neutral emotion, clear the screen message. "
+            "Call when the user has responded / the task resumed.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                auto& app = Application::GetInstance();
+                app.Schedule([]() {
+                    Application::GetInstance().DismissAlert();
+                });
+                if (servo_ok_) {
+                    servo_.Nod();
+                }
+                ESP_LOGI(TAG, "MCP notify dismiss");
+                return true;
+            });
+    }
+
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, -1, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
@@ -2285,6 +2350,7 @@ public:
             RegisterLedMcpTools();
             RegisterExpressionMcpTool();
             RegisterServoMcpTools();
+            RegisterNotifyMcpTools();  // Claude Code 提醒工具（HTTP + LLM 双入口）
         }
 
         InitializeSpi();
@@ -2387,6 +2453,19 @@ public:
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveLevel(level);
+    }
+
+    // 网络就绪后启 HTTP notify server —— 参照 otto-robot::StartNetwork 姿势。
+    // 放构造函数里跑不通：那时 WiFi 还没连、esp_netif 还没起。
+    virtual void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        vTaskDelay(pdMS_TO_TICKS(1000));  // 让 IP 分配稳定
+        notify_http_server_ = new NotifyHttpServer();
+        if (!notify_http_server_->Start(8788)) {
+            ESP_LOGE(TAG, "notify http server failed to start");
+            delete notify_http_server_;
+            notify_http_server_ = nullptr;
+        }
     }
 
     virtual Backlight *GetBacklight() override {
